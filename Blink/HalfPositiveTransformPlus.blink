@@ -1,0 +1,303 @@
+/*
+This tool is used to enhance the precision of half-float values, in order to as much information as possible when precomping, w/o rendering in full 32 bits.
+
+The first iteration of this tool, named HalfPositiveTransform, gives low benefice compared to classic half encoding.
+The base idea is to avoid the possibility to encode negative values (this is meant to be used on a rgb layer. The first bit, originally use to sort the sign bit, is replaced to expand the mantissa. Extending it from 10 to 11 bits. Divind the error by 2.
+
+This new iteration is more complex and requires the creation of a new half precision channel. This can be stored in the alpha (default) if this one isn't used ine the pipe. 
+This channel is mandatory in the event which there indeed are some neg values in the picture (quite common when encoding Arri footage in Acescg). Another channel is needed to differentiate the negative value from the extended mantissa (positive value with mantissa's data in place of the sign bit). 
+If this choice is made, the idea is to fully exploit the data available in these 16 added bits. That's what this algorithm  does.
+
+
+First, sorts channel value into 4 categories :
+  v <= 0 
+  v < 0x38800000
+  v < 2
+  v >= 2
+The result is encoded in 5 bits per input channel (15 bits total) which will be merge with all the pixel's info-channel, then stored in the alpha, then shuffled in mpc.render_infos layer/channel to be rendered with the precomp. 
+The 5 bits are used to know in which of the 4 cases we are, and can be used to store additionnal data used for the precision.
+                                               ___ ___ ___ ___ ___
+                                              |   |   |   |   |   |
+For documentation purpose, bits are ordered : | 4 | 3 | 2 | 1 | 0 |
+                                              |___|___|___|___|___|
+
+Bit 0: represents bit sign. If set, bit 4 is also set, indicating that original value is <0, so the pixel won't be encoded. 
+Bit 4: by defalt matches bit 4 of the half-float's exponent (the 5th bit) hence indicating that the number is >= 2
+    if bit 4 is set and bit 0 isn't, bit 3, 2 and 1 are used to expand the mantissa. Channel's sign bit will store mantissa's 11th bit, and bit 3,2,1 will respectively store bit 12,13,14. Adding 4 bit to the precision.
+    if bit four isn't set, then value is < 2. Bits 3,2,1,0 will respectively store the channel's exponent (input's half-float bit 13 to 10; bit 14 being unset, like bit 4 of this infos channel). The full 16 bits of the input channel being used to extend the mantissa. 
+Note current algorithm doesn't encode denormalised numbers, which are left untouched. This may be implemented in future version, and the current sorting does differ them from <=0 values.
+ ___     ___ ___ ___ ___ ___ ___ ___ ___     ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ ___ 
+|   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |
+| 1 |   | 1 | X | X | X | 1 | 1 | 1 | 1 |   | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | X | X | X | X | X | X | X | X | X | X | X | X | X |
+|___|   |___|___|___|___|___|___|___|___|   |___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|___|
+
+In this channel, groups of 5 bits will be stored as:
+  bit 15 : unused
+  bits 14-10 : blue
+  bits 9-5 : green
+  bits 4-0 : red
+
+This data is then process through this encoding algorithm which will act differently depending on the case:
+  v <= 0 : value is return without any processing. Info channel will get the value 0x11, setting bit 4 and 0.
+  v < 0x38800000 : value is return without any processing (for current version) Info channel will get the value 0x13, setting bit 4, 1 and 0. Hence this case, whilst similar to the precedent, can be processed differently in future implemnentation.
+  v < 2 : value is encoded from float to half, but with a larger mantissa of 16 bits. The mantissa will then be stored in the current channel, while the exponent will be place in the info channel. Being < 2, bit 4 will always be unset, while bits 3-0 will represent the last 4 LSB of the half precision exponent.
+  v >= 2 : bit 4 of the info channel is set, representing MSB of the exponent. bit 0 must stay unset to differentiate with <= 0 values. Sign bit of the channel will store mantissa's 11th bit, then info channel bit 3-1 will store mantissa's bit 12-14, adding 4 bit of precision.
+The invert operation is pretty straight-forward, simply getting the info channel and reversing the encoding operation.
+*/
+
+ unsigned int uint32_recast (float pixel) 
+ {
+   return *(unsigned int *) &pixel;
+ }
+
+ float float_recast (unsigned int pixel) 
+ {
+   return *(float *) &pixel;
+ }
+
+float halfToFloat(unsigned int halfVal)
+{
+    unsigned int  hexpmant = (halfVal << 17) >> 4;
+    unsigned int uVal      = (halfVal >> 15) << 31; //sign
+    
+    if (hexpmant >= 0x00800000)
+    {
+        uVal |= hexpmant;
+        // either we are a normal number, in which case add in the bias difference
+        // otherwise make sure all exponent bits are set
+        if (hexpmant < 0x0f800000)
+            uVal += 0x38000000;
+        else
+            uVal |= 0x7f800000;
+    }
+    else if (hexpmant != 0)
+    {
+        // exponent is 0 because we're denormal, don't have to extract
+        // the mantissa, can just use as is
+
+        unsigned int lc = 0;
+        while (0 == ((hexpmant << lc) & 0x80000000))
+            ++lc;
+        lc -= 8;
+        // so nominally we want to remove that extra bit we shifted
+        // up, but we are going to add that bit back in, then subtract
+        // from it with the 0x38800000 - (lc << 23)....
+        //
+        // by combining, this allows us to skip the & operation (and
+        // remove a constant)
+        //
+        // hexpmant &= ~0x00800000;
+        uVal |= 0x38800000;
+        // lc is now x, where the desired exponent is then
+        // -14 - lc
+        // + 127 -> new exponent
+        uVal |= (hexpmant << lc);
+        uVal -= (lc << 23);
+    }
+    return float_recast(uVal);
+}
+
+unsigned int roundToEven(unsigned int value, int trunc)
+{
+  unsigned int truncOffset = (1 << (trunc-1))-1;
+  return ((value + truncOffset + ((value >> trunc) & 1)) >> trunc);
+}
+
+void denormedHalf(unsigned int pixel, unsigned int &ret)
+{
+    // produce a denormalized half
+    unsigned int exponent   = (pixel >> 23);
+    unsigned int shift = 0x7e - exponent;
+    unsigned int mantissa  = 0x800000 | (pixel & 0x7fffff);
+    unsigned int r     = mantissa << (32 - shift);
+    ret |= (mantissa >> shift);
+
+    if (r > 0x80000000 || (r == 0x80000000 && (ret & 0x1) != 0)) 
+      ++ret;
+}
+
+unsigned int generateChanInfos(float pixel) 
+{
+    unsigned int uintPixel = uint32_recast(pixel);
+
+    if (pixel <= 0.0f)
+        return 0x11;
+    else if (uintPixel < 0x38800000)
+      return 0x13;
+    else if (pixel < 2.0f)
+      //return ((uintPixel>>23) & 0xF);
+      return 0xF;
+    else
+      //return (0x10 | ((uintPixel>>9) & 0x7)<<1);
+      return 0x10;
+    
+}
+
+unsigned int  floatToLargeHalf (float pixel, int truncSize) //default trunc = 13
+{
+    unsigned int uPixel = uint32_recast(pixel);
+    unsigned int sign, exponent, mantissa, shift, r;
+    unsigned int ret;   
+
+    ret = (uPixel >> 16) & 0x8000;    
+    exponent = (uPixel >> 23) & 0xFFFF;
+    mantissa = uPixel & 0x7FFFFF;
+
+    unsigned int uVal = uPixel & ~0x80000000;
+
+    // exponent large enough to result in a normal number, round and return
+    if (uVal >= 0x38800000) {
+        // inf or nan
+        if (uVal >= 0x7f800000)
+        {
+            ret |= 0x7c00;
+            if (uVal == 0x7f800000) return ret;
+            mantissa = (uVal & 0x7fffff) >> truncSize;
+            // make sure we have at least one bit after shift to preserve nan-ness
+            return ( (ret << (13-truncSize))  | (unsigned short ) mantissa | (unsigned short) (mantissa == 0));
+        }
+
+        // too large, round to infinity
+        if (uVal > 0x477fefff) {
+            return 0x7c00;
+        }
+        //return ret;
+        uVal -= 0x38000000; //Trunc exponent
+        uVal = roundToEven(uVal, truncSize); 
+        return (ret << (13-truncSize)) | uVal;
+    }
+
+    // zero or flush to 0
+    if (uVal < 0x33000001) {
+        return ret;
+    }
+
+    // produce a denormalized half
+    denormedHalf(uVal, ret);
+
+    return ret;
+}
+
+float toPositivePixel(float pixel, unsigned int &chanInfos) 
+{
+    chanInfos = generateChanInfos(pixel);
+    unsigned int uPixel = uint32_recast(pixel);
+    unsigned int ret;
+    unsigned int mantissa;
+    
+    // pixel <= 0
+    if (chanInfos == 0x11)
+      return pixel;
+
+    // pixel >=2
+    else if(chanInfos == 0x10) 
+    {
+      ret = floatToLargeHalf(pixel, 9);
+      chanInfos |= (ret & 0x7)<<1;      
+      ret >>= 3;
+      int addedBit = ret & 1;
+      ret >>= 1;
+      ret |= (addedBit<<15);
+      return halfToFloat(ret); 
+    }
+    //Denorm'ed numbers
+    else if (chanInfos == 0x13) 
+      //return float_recast(denormedHalf(uPixel));
+      return pixel;
+    
+    // Value between denorm'ed and 2 (excluded)
+    ret = roundToEven(uPixel, 7);
+    mantissa = ret & 0xFFFF;
+    chanInfos = (ret >> 16) & 0xF;
+    return halfToFloat(mantissa);    
+}
+
+float fromPositivePixel(float pixel, unsigned int chanInfos) 
+{
+    unsigned int uPixel = uint32_recast(pixel);
+    unsigned int ret;
+    if (chanInfos == 0x11 || chanInfos == 0x13)
+      return pixel;
+
+    else if (chanInfos >= 0x10)
+    {
+      ret = uPixel;
+      ret |= ((uPixel >> 31)&1) << 12;
+      ret |= ((chanInfos & 0xE)<<8);
+
+    } else if (chanInfos < 0x10)
+    { 
+      ret = floatToLargeHalf(pixel, 13 )<<7;
+      ret |= ((chanInfos & 0xF) << 23) ;
+      ret += 0x38000000;
+    }
+    ret &= 0x7FFFFFFF;
+    return float_recast(ret);
+}
+
+kernel HaflPositiveTransform : ImageComputationKernel<ePixelWise>
+{
+  Image<eRead, eAccessPoint, eEdgeClamped> src; // the input image
+  Image<eWrite> dst; // the output image
+
+  param:
+    bool direction;
+
+  local:
+
+  // In define(), parameters can be given labels and default values.
+  void define() 
+  {
+    defineParam(direction, "Inverse Direction", false);
+  }
+
+  // The init() function is run before any calls to process().
+  // Local variables can be initialized here.
+  void init() 
+  {
+  }
+  
+  float4 toPositiveHalf(float4 pixel)
+  {
+    unsigned int infos = 0;
+    unsigned int chanInfos;
+    float3 outPixel;
+    float chan;
+    
+    for (int i=0; i<3; i++){
+      chan = pixel[i]; 
+      outPixel[i] = toPositivePixel(chan, chanInfos);
+      int offset = 5*i;
+      infos |= (chanInfos << offset);
+    }
+
+    float outInfos = halfToFloat(infos);
+    return float4(outPixel, outInfos);
+  }
+
+  float4 fromPositiveHalf(float4 pixel)
+  {
+    float3 outPixel;
+    float chan;
+    unsigned int chanInfos;
+    unsigned int uInfos = floatToLargeHalf(pixel[3], 12)>>1;
+    
+    for (int i=0; i<3; i++){
+      chan = pixel[i];
+      chanInfos = (uInfos >> (5*i)) & 0x1F;
+      outPixel[i] = fromPositivePixel(chan,chanInfos);
+    }
+    return float4(outPixel, float_recast(uInfos));
+  }
+
+  void process() 
+  {
+    float4 pixel = src();
+
+    if (direction)
+      dst() = fromPositiveHalf(pixel);    
+    else 
+      dst() = toPositiveHalf(pixel);
+ 
+  }
+};

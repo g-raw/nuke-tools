@@ -1,0 +1,155 @@
+kernel HalfPositiveTransform : ImageComputationKernel<eComponentWise>
+{
+  Image<eRead, eAccessPoint, eEdgeClamped> src; // the input image
+  Image<eWrite> dst; // the output image
+
+  param:
+    bool direction; // This parameter is made available to the user.
+
+  local:
+
+  // In define(), parameters can be given labels and default values.
+  void define() {
+    defineParam(direction, "Inverse Direction", false);
+  }
+
+  // The init() function is run before any calls to process().
+  // Local variables can be initialized here.
+  void init() {
+  }
+
+  unsigned int uint32_recast (float pixel) {
+
+    return *(unsigned int *) &pixel;
+
+  }
+
+  float float_recast (unsigned int pixel) {
+
+    return *(float *) &pixel;
+
+  }
+
+float halfToFloat(unsigned int halfVal)
+{
+    unsigned int  hexpmant = (halfVal << 17) >> 4;
+    unsigned int uVal          = (halfVal >> 15) << 31;
+
+    if (hexpmant >= 0x00800000)
+    {
+        uVal |= hexpmant;
+        // either we are a normal number, in which case add in the bias difference
+        // otherwise make sure all exponent bits are set
+        if (hexpmant < 0x0f800000)
+            uVal += 0x38000000;
+        else
+            uVal |= 0x7f800000;
+    }
+    else if (hexpmant != 0)
+    {
+        // exponent is 0 because we're denormal, don't have to extract
+        // the mantissa, can just use as is
+
+        unsigned int lc = 0;
+        while (0 == ((hexpmant << lc) & 0x80000000))
+            ++lc;
+        lc -= 8;
+        // so nominally we want to remove that extra bit we shifted
+        // up, but we are going to add that bit back in, then subtract
+        // from it with the 0x38800000 - (lc << 23)....
+        //
+        // by combining, this allows us to skip the & operation (and
+        // remove a constant)
+        //
+        // hexpmant &= ~0x00800000;
+        uVal |= 0x38800000;
+        // lc is now x, where the desired exponent is then
+        // -14 - lc
+        // + 127 -> new exponent
+        uVal |= (hexpmant << lc);
+        uVal -= (lc << 23);
+    }
+    return float_recast(uVal);
+}
+
+
+  unsigned int  floatToLargeHalf (float pixel) {
+    unsigned int uPixel = uint32_recast(pixel);
+    unsigned int sign, exponent, mantissa, shift, r;
+    unsigned int ret;   
+
+    ret = (uPixel >> 16) & 0x8000;    
+    exponent = (uPixel >> 23);
+    mantissa = uPixel & 0x7FFFFF;
+
+    unsigned int uVal = uPixel & ~0x80000000;
+
+    // exponent large enough to result in a normal number, round and return
+    if (uVal >= 0x38800000) {
+        // inf or nan
+        if (uVal >= 0x7f800000)
+        {
+            ret |= 0x7c00;
+            if (uVal == 0x7f800000) return ret<<1;
+            mantissa = (uVal & 0x7fffff) >> 12;
+            // make sure we have at least one bit after shift to preserve nan-ness
+            return (ret | (unsigned short ) mantissa | (unsigned short) (mantissa == 0)) << 1;
+        }
+
+        // too large, round to infinity
+        if (uVal > 0x477fefff) {
+            return (ret | 0x7c00) << 1;
+        }
+
+        uVal -= 0x38000000; //Trunc exponent
+        //uVal = ((uVal + 0x00000fff + ((uVal >> 13) & 1)) >> 13);
+        uVal = ((uVal + 0x000007ff + ((uVal >> 12) & 1)) >> 12);
+        return (ret << 1) |  uVal;
+    }
+
+    // zero or flush to 0
+    if (uVal < 0x33000001) {
+        return 0; //We don't care about sign
+    }
+
+    // produce a denormalized half
+    exponent   = (uVal >> 23);
+    shift = 0x7e - exponent;
+    mantissa  = 0x800000 | (uVal & 0x7fffff);
+    r     = mantissa << (32 - shift);
+    ret |= (mantissa >> shift);
+
+    if (r > 0x80000000 || (r == 0x80000000 && (ret & 0x1) != 0)) ++ret;
+
+    return ret << 1;
+   }
+
+  float toPositiveHalf(float pixel) {
+    unsigned int value = floatToLargeHalf(pixel);
+    char addedBit = value & 1;
+    value >>= 1;
+    value |= (addedBit<<15);
+    return halfToFloat(value); 
+  }
+
+  float fromPositiveHalf(float pixel) {
+    unsigned int uValue = uint32_recast(pixel);
+    uValue |= ((uValue >> 31)&1) << 12;
+    uValue &= 0x7FFFFFFF;
+    return float_recast(uValue);
+  }
+
+  void process() {
+    // Read the input image
+    float pixel = src();
+    float outValue;
+
+    if (direction){
+      outValue = fromPositiveHalf(pixel);    
+    } else {
+      outValue = toPositiveHalf(pixel);
+    }   
+    // Write the result to the output image
+    dst() = outValue;
+  }
+};
